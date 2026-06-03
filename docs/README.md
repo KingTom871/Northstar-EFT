@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="../resources/icon.png" alt="Northstar" width="512" style="zoom:30%;">
+  <img src="../resources/icon.png" alt="Northstar" width="128">
 </div>
 
 ## Northstar 是一款为 Escape from Tarkov 打造的现代化桌面工具
