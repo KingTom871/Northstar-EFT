@@ -1,72 +1,171 @@
-import { app, shell, BrowserWindow, ipcMain } from "electron";
+import { app, shell, BrowserWindow, Tray, Menu, nativeImage } from "electron";
 import { join } from "path";
+import { screen } from "electron";
 import { electronApp, optimizer, is } from "@electron-toolkit/utils";
 import icon from "../../resources/icon.png?asset";
 
-function createWindow(): void {
-  // Create the browser window.
-  const mainWindow = new BrowserWindow({
-    width: 900,
-    height: 670,
+// Keep references globally to prevent GC
+let overlayWindow: BrowserWindow | null = null;
+let tray: Tray | null = null;
+
+// Create the fullscreen overlay window.
+function createOverlayWindow(): BrowserWindow {
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const { width, height } = primaryDisplay.bounds;
+
+  const overlayWin = new BrowserWindow({
+    x: 0,
+    y: 0,
+    width: width,
+    height: height,
+    transparent: true,
+    // alwaysOnTop: true,
+    frame: false,
+    skipTaskbar: true,
     show: false,
-    autoHideMenuBar: true,
-    icon: icon,
     webPreferences: {
       preload: join(__dirname, "../preload/index.js"),
-      sandbox: false,
+      contextIsolation: true,
+      nodeIntegration: false,
     },
   });
 
-  mainWindow.on("ready-to-show", () => {
-    mainWindow.show();
-  });
+  // Load the renderer content
+  if (is.dev && process.env["ELECTRON_RENDERER_URL"]) {
+    overlayWin.loadURL(process.env["ELECTRON_RENDERER_URL"]);
+  } else {
+    overlayWin.loadFile(join(__dirname, "../renderer/index.html"));
+  }
 
-  mainWindow.webContents.setWindowOpenHandler((details) => {
+  // Handle external links - open in default browser instead of overlay
+  overlayWin.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url);
     return { action: "deny" };
   });
 
-  // HMR for renderer base on electron-vite cli.
-  // Load the remote URL for development or the local html file for production.
-  if (is.dev && process.env["ELECTRON_RENDERER_URL"]) {
-    mainWindow.loadURL(process.env["ELECTRON_RENDERER_URL"]);
-  } else {
-    mainWindow.loadFile(join(__dirname, "../renderer/index.html"));
+  // Show the window when content is ready
+  overlayWin.webContents.on("did-finish-load", () => {
+    overlayWin.show();
+  });
+
+  return overlayWin;
+}
+
+// Create system tray icon and context menu
+function createTray(): void {
+  const trayIcon = nativeImage.createFromPath(typeof icon === "string" ? icon : app.getAppPath());
+
+  tray = new Tray(trayIcon);
+
+  // Build tray context menu
+  const contextMenu = Menu.buildFromTemplate([
+    {
+      label: "Open DevTools",
+      click: () => {
+        if (overlayWindow) {
+          overlayWindow.webContents.openDevTools({ mode: "detach" });
+        }
+      },
+    },
+    { type: "separator" },
+    {
+      label: "Exit",
+      click: () => {
+        app.quit();
+      },
+    },
+  ]);
+
+  tray.setContextMenu(contextMenu);
+  tray.setToolTip("Northstar");
+}
+
+/**
+ * Restore tray icon if Explorer.exe restarts and removes it from system tray.
+ * This handles the WM_TASKBARCREATED message on Windows.
+ */
+function restoreTrayOnExplorerRestart(windowWin: BrowserWindow): void {
+  // Only run on Windows
+  if (process.platform !== "win32") return;
+
+  // When Explorer restarts, it sends a WM_TASKBARCREATED message to all top-level windows.
+  const WM_TASKBARCREATED = 0xc000;
+
+  try {
+    windowWin.hookWindowMessage(WM_TASKBARCREATED, () => {
+      console.log("Explorer restarted, restoring tray icon...");
+      // If the tray was destroyed by Explorer restart, recreate it
+      if (!tray || tray.isDestroyed()) {
+        createTray();
+      }
+    });
+  } catch (error) {
+    console.error("Failed to bind taskbar recreated listener:", error);
   }
 }
 
-// This method will be called when Electron has finished
-// initialization and is ready to create browser windows.
-// Some APIs can only be used after this event occurs.
-app.whenReady().then(() => {
-  // Set app user model id for windows
-  electronApp.setAppUserModelId("com.electron");
+// Prevent multiple instances of the application.
+function preventMultipleInstances(): void {
+  const gotTheLock = app.requestSingleInstanceLock();
 
-  // Default open or close DevTools by F12 in development
-  // and ignore CommandOrControl + R in production.
-  // see https://github.com/alex8088/electron-toolkit/tree/master/packages/utils
-  app.on("browser-window-created", (_, window) => {
-    optimizer.watchWindowShortcuts(window);
+  if (!gotTheLock) {
+    app.quit();
+    return;
+  }
+
+  app.on("second-instance", () => {
+    // User tried to run a second instance, bring focus to existing window
+    if (overlayWindow) {
+      overlayWindow.show();
+      overlayWindow.focus();
+    }
+  });
+}
+
+// App initialization and event handling
+(() => {
+  // Prevent multiple instances
+  preventMultipleInstances();
+
+  // Handle app ready event
+  app.whenReady().then(() => {
+    // Set app user model id for Windows
+    electronApp.setAppUserModelId("com.northstar.eft");
+
+    // Create the overlay window
+    overlayWindow = createOverlayWindow();
+
+    // Create system tray after app starts
+    createTray();
+
+    // Restore tray on Explorer restart
+    restoreTrayOnExplorerRestart(overlayWindow);
+
+    // Watch for window shortcuts (F12 DevTools toggle)
+    app.on("browser-window-created", (_, window) => {
+      optimizer.watchWindowShortcuts(window);
+    });
   });
 
-  // IPC test
-  ipcMain.on("ping", () => console.log("pong"));
-
-  createWindow();
-
-  app.on("activate", function () {
-    // On macOS it's common to re-create a window in the app when the
-    // dock icon is clicked and there are no other windows open.
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  // Quit application when all windows are closed
+  app.on("window-all-closed", () => {
+    app.quit();
   });
-});
 
-// Quit when all windows are closed, except on macOS. There, it's common
-// for applications and their menu bar to stay active until the user quits
-// explicitly with Cmd + Q.
-app.on("window-all-closed", () => {
-  app.quit();
-});
+  // Cleanup tray on exit
+  app.on("before-quit", () => {
+    if (tray) {
+      tray.destroy();
+      tray = null;
+    }
+  });
 
-// In this file you can include the rest of your app's specific main process
-// code. You can also put them in separate files and require them here.
+  // On macOS, re-create window when dock icon is clicked
+  app.on("activate", () => {
+    if (!overlayWindow && process.platform === "darwin") {
+      overlayWindow = createOverlayWindow();
+    } else if (overlayWindow) {
+      overlayWindow.show();
+    }
+  });
+})();
